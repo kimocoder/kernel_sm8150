@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -135,6 +135,12 @@ static int fastrpc_pdr_notifier_cb(struct notifier_block *nb,
 					void *data);
 static struct dentry *debugfs_root;
 static struct dentry *debugfs_global_file;
+
+atomic_t total_buf_size;
+int read_fastrpc_usage(void)
+{
+	return atomic_read(&total_buf_size) / PAGE_SIZE;
+}
 
 static inline uint64_t buf_page_start(uint64_t buf)
 {
@@ -329,6 +335,7 @@ struct fastrpc_mmap {
 	int refs;
 	uintptr_t raddr;
 	int uncached;
+	bool is_filemap; /*flag to indicate map used in process init*/
 	int secure;
 	uintptr_t attr;
 };
@@ -386,6 +393,7 @@ struct fastrpc_file {
 	struct mutex perf_mutex;
 	struct pm_qos_request pm_qos_req;
 	int qos_request;
+	struct mutex pm_qos_mutex;
 	struct mutex map_mutex;
 	struct mutex internal_map_mutex;
 	/* Identifies the device (MINOR_NUM_DEV / MINOR_NUM_SECURE_DEV) */
@@ -533,6 +541,7 @@ static void fastrpc_buf_free(struct fastrpc_buf *buf, int cache)
 			hyp_assign_phys(buf->phys, buf_page_size(buf->size),
 				srcVM, 2, destVM, destVMperm, 1);
 		}
+		atomic_sub(buf->size, &total_buf_size);
 		dma_free_attrs(fl->sctx->smmu.dev, buf->size, buf->virt,
 					buf->phys, buf->dma_attr);
 	}
@@ -681,9 +690,10 @@ static int fastrpc_mmap_remove(struct fastrpc_file *fl, uintptr_t va,
 
 	spin_lock(&me->hlock);
 	hlist_for_each_entry_safe(map, n, &me->maps, hn) {
-		if (map->raddr == va &&
+		if (map->refs == 1 && map->raddr == va &&
 			map->raddr + map->len == va + len &&
-			map->refs == 1) {
+			/*Remove map if not used in process initialization*/
+			!map->is_filemap) {
 			match = map;
 			hlist_del_init(&map->hn);
 			break;
@@ -695,9 +705,10 @@ static int fastrpc_mmap_remove(struct fastrpc_file *fl, uintptr_t va,
 		return 0;
 	}
 	hlist_for_each_entry_safe(map, n, &fl->maps, hn) {
-		if (map->raddr == va &&
+		if (map->refs == 1 && map->raddr == va &&
 			map->raddr + map->len == va + len &&
-			map->refs == 1) {
+			/*Remove map if not used in process initialization*/
+			!map->is_filemap) {
 			match = map;
 			hlist_del_init(&map->hn);
 			break;
@@ -830,6 +841,7 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 	map->refs = 1;
 	map->fl = fl;
 	map->fd = fd;
+	map->is_filemap = false;
 	map->attr = attr;
 	if (mflags == ADSP_MMAP_HEAP_ADDR ||
 				mflags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
@@ -1032,6 +1044,7 @@ static int fastrpc_buf_alloc(struct fastrpc_file *fl, size_t size,
 	buf->flags = rflags;
 	buf->raddr = 0;
 	buf->remote = 0;
+	atomic_add(size, &total_buf_size);
 	buf->virt = dma_alloc_attrs(fl->sctx->smmu.dev, buf->size,
 						(dma_addr_t *)&buf->phys,
 						GFP_KERNEL, buf->dma_attr);
@@ -2131,6 +2144,8 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 			mutex_lock(&fl->map_mutex);
 			VERIFY(err, !fastrpc_mmap_create(fl, init->filefd, 0,
 				init->file, init->filelen, mflags, &file));
+			if (file)
+				file->is_filemap = true;
 			mutex_unlock(&fl->map_mutex);
 			if (err)
 				goto bail;
@@ -2140,7 +2155,7 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 		VERIFY(err, !init->mem);
 		if (err) {
 			err = -EINVAL;
-			pr_err("adsprpc: %s: %s: ERROR: donated memory allocated in userspace\n",
+			pr_err("adsprpc: %s: %s: ERROR: donated memory allocated in userspace \n",
 				current->comm, __func__);
 			goto bail;
 		}
@@ -3021,6 +3036,7 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 	mutex_destroy(&fl->perf_mutex);
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->internal_map_mutex);
+	mutex_destroy(&fl->pm_qos_mutex);
 	kfree(fl);
 	return 0;
 }
@@ -3369,6 +3385,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 	hlist_add_head(&fl->hn, &me->drivers);
 	spin_unlock(&me->hlock);
 	mutex_init(&fl->perf_mutex);
+	mutex_init(&fl->pm_qos_mutex);
 	return 0;
 }
 
@@ -3469,12 +3486,14 @@ static int fastrpc_internal_control(struct fastrpc_file *fl,
 		VERIFY(err, latency != 0);
 		if (err)
 			goto bail;
+		mutex_lock(&fl->pm_qos_mutex);
 		if (!fl->qos_request) {
 			pm_qos_add_request(&fl->pm_qos_req,
 				PM_QOS_CPU_DMA_LATENCY, latency);
 			fl->qos_request = 1;
 		} else
 			pm_qos_update_request(&fl->pm_qos_req, latency);
+		mutex_unlock(&fl->pm_qos_mutex);
 		break;
 	case FASTRPC_CONTROL_KALLOC:
 		cp->kalloc.kalloc_support = 1;
@@ -4222,15 +4241,16 @@ static int fastrpc_probe(struct platform_device *pdev)
 		if (range.addr && !of_property_read_bool(dev->of_node,
 							 "restrict-access")) {
 			int srcVM[1] = {VMID_HLOS};
-			int destVM[3] = {VMID_HLOS, VMID_SSC_Q6,
+			int destVM[4] = {VMID_HLOS, VMID_MSS_MSA, VMID_SSC_Q6,
 						VMID_ADSP_Q6};
-			int destVMperm[3] = {PERM_READ | PERM_WRITE | PERM_EXEC,
+			int destVMperm[4] = {PERM_READ | PERM_WRITE | PERM_EXEC,
+				PERM_READ | PERM_WRITE | PERM_EXEC,
 				PERM_READ | PERM_WRITE | PERM_EXEC,
 				PERM_READ | PERM_WRITE | PERM_EXEC,
 				};
 
 			VERIFY(err, !hyp_assign_phys(range.addr, range.size,
-					srcVM, 1, destVM, destVMperm, 3));
+					srcVM, 1, destVM, destVMperm, 4));
 			if (err)
 				goto bail;
 			me->range.addr = range.addr;
